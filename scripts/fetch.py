@@ -2,13 +2,21 @@
 # -*- coding: utf-8 -*-
 """slide-image-fetch — PPT 配图抓取（整合版）
 
-策略链：Google Images（持久化 Edge + Playwright）→ Bing HTTP → Openverse → Wikimedia Commons
+策略链（2026-10-16 v3：验证码 Agent 自动辅助 + 多引擎兜底）：
+  Google Images（浏览器）→ Yahoo Images（浏览器）→ 百度图片（浏览器）
+  → Bing HTTP → Openverse → Wikimedia Commons
+  * Google 遇 /sorry/ 人机验证：用户已授权 Agent 辅助验证——
+    ① 脚本自动勾选"我不是机器人"checkbox；
+    ② 若弹出图片挑战：截图保存并打印 CAPTCHA_WAIT 标记，Agent Read 截图判读后
+       写 captcha_answer.json {"cells":[0,4,8]}（0 起行优先网格序号），脚本代点并提交；
+    ③ 超时/多次失败自动放弃，转下一搜索引擎（百度/Yahoo→Bing→Openverse→Commons）。
+  * --sorry-wait N：验证出现时先留 N 秒人工窗口（默认 0，直接走 Agent 辅助流程）。
+  * 浏览器通道只用 Google/Yahoo/百度；Bing 走免浏览器 HTTP（其验证无法点击，直接降级）。
 整合来源：
   - GPT 原型 v0.3（异步下载/PIL 验证/SQLite 缓存/失败分类/多路径合流提取）
   - 实测修正（2026-10-16）：
     * connect_over_cdp 改 launch_persistent_context（Edge 端口绑定不稳）
     * 运行前清除 *_proxy 环境变量对 127.0.0.1 的影响（playwright 会走系统代理导致 502）
-    * Google sorry/验证码页检测 → 提示用户人工过一次（profile 持久化后 cookie 复用）
     * Commons 兜底必须过滤 MIME（原实现抓回一堆 PDF）
     * 候选命名 name_cN.ext（Agent 逐张 Read 核对后 mv 为正式名），不按尺寸降序选图
     * 黑名单域名（图库水印/新闻 CDN/内容农场/电商）
@@ -21,7 +29,7 @@ import argparse, asyncio, hashlib, io, json, logging, os, re, sqlite3, sys, time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, quote, quote_plus, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 
 # 关键：清除代理环境变量，防止 playwright/系统组件把 127.0.0.1 也送进代理
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
@@ -90,7 +98,7 @@ def unique_records(records):
     return out
 
 
-# ---------------- 浏览器：持久化 Edge + sorry 人工通过 ----------------
+# ---------------- 浏览器：持久化 Edge（Google / Yahoo / 百度） ----------------
 
 async def open_browser(p, proxy):
     return await p.chromium.launch_persistent_context(
@@ -100,23 +108,174 @@ async def open_browser(p, proxy):
               "--disable-session-crashed-bubble", "--hide-crash-restore-bubble"])
 
 
-async def wait_if_sorry(page, timeout_s=150):
-    """Google 风控页：保持窗口打开，等用户人工点过 reCAPTCHA；cookie 存进持久化 profile。"""
+async def skip_if_sorry(page, captcha_dir=None, grace_s=0):
+    """Google 风控页处理入口。
+    grace_s > 0：先留人工窗口；之后走 Agent 自动辅助验证（勾选 checkbox + 图片挑战代点）。
+    验证失败/超时 → 放弃本通道，转下一搜索引擎。"""
     if "/sorry/" not in page.url:
         return True
-    print("\n>>> Google 弹出人机验证：请在刚打开的 Edge 窗口里点一次\"我不是机器人\"，"
-          "通过后脚本自动继续（profile 会记住，一般只需一次）…", flush=True)
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        await page.wait_for_timeout(1500)
+    if grace_s > 0:
+        t0 = time.time()
+        while time.time() - t0 < grace_s and "/sorry/" in page.url:
+            await page.wait_for_timeout(1000)
         if "/sorry/" not in page.url:
-            print(">>> 验证已通过，继续抓取。\n", flush=True)
+            print(">>> 人工验证已通过，继续 Google 通道。\n", flush=True)
             return True
-    print(">>> 等待超时，跳过 Google 通道。", flush=True)
+    if captcha_dir is not None:
+        return await auto_verify_recaptcha(page, Path(captcha_dir))
+    print(">>> Google 触发人机验证：自动放弃 Google 通道，转下一搜索引擎…", flush=True)
     return False
 
 
-async def discover_google(query, ctx, max_clicks=8, max_candidates=25):
+async def _find_recaptcha_frames(page):
+    anchor = bframe = None
+    for f in page.frames:
+        u = f.url or ""
+        if "recaptcha/api2/anchor" in u:
+            anchor = f
+        elif "recaptcha/api2/bframe" in u:
+            bframe = f
+    return anchor, bframe
+
+
+async def _challenge_tiles(bframe):
+    """返回挑战网格 tile 定位器（兼容 3x3 td/img 与 4x4 等多种 DOM）。"""
+    for sel in ("table td.rc-imageselect-tile", ".rc-imageselect-tile", "img.rc-image-tile",
+                "#rc-imageselect-target td", ".rc-imageselect-tile-wrapper img"):
+        try:
+            loc = bframe.locator(sel)
+            if await loc.count() >= 4:
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+async def auto_verify_recaptcha(page, captcha_dir, budget_s=300, answer_timeout_s=120):
+    """Agent 辅助过验证（用户已授权）：
+    1) 自动点 reCAPTCHA checkbox，很多情况勾选即过；
+    2) 出现图片挑战 → 全页截图存 captcha_state.png，写 captcha_state.json，
+       打印 CAPTCHA_WAIT 标记 → Agent Read 截图判读 → 写 captcha_answer.json
+       {"cells":[网格序号 0 起行优先]} → 脚本代点 + 点提交 → 复查循环；
+    3) 超出预算/答案超时 → 放弃转下一引擎。"""
+    captcha_dir.mkdir(parents=True, exist_ok=True)
+    state_path = captcha_dir / "captcha_state.json"
+    answer_path = captcha_dir / "captcha_answer.json"
+    shot_path = captcha_dir / "captcha_state.png"
+
+    def write_state(st, extra=None):
+        data = {"status": st, "time": datetime.now(timezone.utc).isoformat()}
+        if extra:
+            data.update(extra)
+        state_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    if answer_path.exists():
+        answer_path.unlink()
+
+    # 1) 勾选"我不是机器人"
+    try:
+        anchor, _ = await _find_recaptcha_frames(page)
+        if anchor is not None:
+            await anchor.locator("#recaptcha-anchor").click(timeout=4000)
+            await page.wait_for_timeout(3500)
+    except Exception as exc:
+        LOG.debug("checkbox click failed: %s", exc)
+    if "/sorry/" not in page.url:
+        write_state("passed")
+        print(">>> reCAPTCHA 勾选即通过，继续 Google 通道。\n", flush=True)
+        return True
+
+    t0 = time.time()
+    attempts = 0
+    while time.time() - t0 < budget_s and "/sorry/" in page.url:
+        anchor, bframe = await _find_recaptcha_frames(page)
+        if bframe is None:
+            # 挑战窗未开：再试勾选 checkbox
+            if anchor is not None:
+                try:
+                    await anchor.locator("#recaptcha-anchor").click(timeout=3000)
+                    await page.wait_for_timeout(3000)
+                    if "/sorry/" not in page.url:
+                        write_state("passed")
+                        print(">>> reCAPTCHA 勾选即通过，继续 Google 通道。\n", flush=True)
+                        return True
+                except Exception:
+                    pass
+            await page.wait_for_timeout(2000)
+            continue
+
+        attempts += 1
+        prompt, grid = "", "3x3"
+        try:
+            prompt = (await bframe.locator(".rc-imageselect-instructions").inner_text(timeout=1500)).strip()
+        except Exception:
+            pass
+        tiles = await _challenge_tiles(bframe)
+        if tiles is not None:
+            n = await tiles.count()
+            grid = {9: "3x3", 16: "4x4", 8: "2x4", 6: "2x3", 4: "2x2"}.get(n, "%dtiles" % n)
+        try:
+            await page.screenshot(path=str(shot_path))
+        except Exception as exc:
+            LOG.debug("screenshot failed: %s", exc)
+        write_state("challenge", {"screenshot": str(shot_path), "prompt": prompt, "grid": grid,
+                                  "attempts": attempts, "answer_file": str(answer_path)})
+        print("CAPTCHA_WAIT %s grid=%s attempts=%d prompt=%s" % (shot_path, grid, attempts, prompt or "?"),
+              flush=True)
+
+        # 等 Agent 答案
+        ans, wt0 = None, time.time()
+        while time.time() - wt0 < answer_timeout_s:
+            if answer_path.exists():
+                try:
+                    ans = json.loads(answer_path.read_text(encoding="utf-8"))
+                except Exception:
+                    ans = None
+                if ans:
+                    break
+            await page.wait_for_timeout(1000)
+        if not ans:
+            print(">>> 等待辅助答案超时，放弃 Google 通道。", flush=True)
+            write_state("abandoned", {"reason": "answer_timeout"})
+            return False
+        answer_path.unlink()
+
+        # 代点答案网格
+        try:
+            cells = ans.get("cells") or []
+            if tiles is not None:
+                n = await tiles.count()
+                for ci in cells:
+                    if isinstance(ci, int) and 0 <= ci < n:
+                        bb = await tiles.nth(ci).bounding_box(timeout=2000)
+                        if bb:
+                            await page.mouse.click(bb["x"] + bb["width"] / 2.0,
+                                                   bb["y"] + bb["height"] / 2.0)
+                            await page.wait_for_timeout(400)
+            if ans.get("no_verify") is not True:
+                await page.wait_for_timeout(500)
+                try:
+                    await bframe.locator("#recaptcha-verify-button").click(timeout=3000)
+                except Exception:
+                    try:
+                        await bframe.locator(".rc-imageselect-submit").click(timeout=1500)
+                    except Exception:
+                        pass
+            await page.wait_for_timeout(4000)
+        except Exception as exc:
+            LOG.debug("answer apply failed: %s", exc)
+
+        if "/sorry/" not in page.url:
+            write_state("passed")
+            print(">>> 图片挑战通过，继续 Google 通道。\n", flush=True)
+            return True
+
+    write_state("abandoned", {"reason": "budget_or_failed"})
+    print(">>> 自动验证未通过，转下一搜索引擎。", flush=True)
+    return False
+
+
+async def discover_google(query, ctx, max_clicks=8, max_candidates=25, grace_s=0, captcha_dir=None):
     records, observed = [], []
     page = await ctx.new_page()
     page.set_default_timeout(4500)
@@ -133,7 +292,7 @@ async def discover_google(query, ctx, max_clicks=8, max_candidates=25):
     page.on("response", on_response)
     await page.goto("https://www.google.com/search?tbm=isch&hl=en&q=" + quote_plus(query),
                     wait_until="domcontentloaded", timeout=25000)
-    if not await wait_if_sorry(page):
+    if not await skip_if_sorry(page, captcha_dir, grace_s):
         await page.close()
         return []
     try:
@@ -192,6 +351,86 @@ async def discover_google(query, ctx, max_clicks=8, max_candidates=25):
             add(u, "network_unlinked")
     await page.close()
     return unique_records(records)[:max_candidates]
+
+
+async def discover_yahoo(query, ctx, limit=40):
+    """Yahoo 图片（浏览器）：结果链接里 imgurl= 参数即原图地址。"""
+    records = []
+    page = await ctx.new_page()
+    page.set_default_timeout(6000)
+    try:
+        await page.goto("https://images.search.yahoo.com/search/images?p=" + quote_plus(query),
+                        wait_until="domcontentloaded", timeout=25000)
+        await page.wait_for_timeout(1200)
+        hrefs = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .filter(h => h.indexOf('imgurl=') !== -1)
+                .slice(0, 80)""")
+        seen = set()
+        for h in hrefs:
+            try:
+                q = parse_qs(urlparse(h).query)
+                u = (q.get("imgurl") or [None])[0]
+                if not u:
+                    continue
+                if u[:7].lower() in ("http%3a", "http%3A") or u.startswith("http%3A"):
+                    u = unquote(u)
+                if u and u not in seen and image_url_is_possible(u):
+                    seen.add(u)
+                    records.append({"url": u, "source_page": h, "thumbnail": "",
+                                    "alt": "", "discovery": "yahoo_imgurl",
+                                    "provider": "yahoo"})
+                if len(records) >= limit:
+                    break
+            except Exception:
+                continue
+    except Exception as exc:
+        LOG.warning("Yahoo discovery failed: %s", exc)
+    finally:
+        await page.close()
+    return unique_records(records)[:limit]
+
+
+async def discover_baidu(query, ctx, limit=40):
+    """百度图片（浏览器）：从页面内嵌 JSON 提取 objURL 原图地址。"""
+    records = []
+    page = await ctx.new_page()
+    page.set_default_timeout(6000)
+    try:
+        await page.goto("https://image.baidu.com/search/index?tn=baiduimage&word=" + quote_plus(query),
+                        wait_until="domcontentloaded", timeout=25000)
+        await page.wait_for_timeout(1500)
+        raws = await page.evaluate(
+            r"""() => {
+              const html = document.documentElement.innerHTML;
+              const out = [];
+              const re = /"(?:objURL|objurl|middleURL)":"((?:[^"\\]|\\.)*)"/g;
+              let m;
+              while ((m = re.exec(html)) !== null) {
+                if (out.length >= 80) break;
+                out.push(m[1]);
+              }
+              return out;
+            }""")
+        seen = set()
+        for raw in raws:
+            try:
+                u = json.loads('"' + raw + '"')
+            except Exception:
+                u = raw
+            if u and u not in seen and image_url_is_possible(u):
+                seen.add(u)
+                records.append({"url": u, "source_page": "https://image.baidu.com/search/index?tn=baiduimage&word=" + quote_plus(query),
+                                "thumbnail": "", "alt": "", "discovery": "baidu_objurl",
+                                "provider": "baidu"})
+            if len(records) >= limit:
+                break
+    except Exception as exc:
+        LOG.warning("Baidu discovery failed: %s", exc)
+    finally:
+        await page.close()
+    return unique_records(records)[:limit]
 
 
 # ---------------- 公共 API 兜底 ----------------
@@ -372,9 +611,22 @@ async def run_task(name, query, ctx, client, cache, folder, args):
     records = []
     if not args.no_google and ctx is not None:
         try:
-            records = await discover_google(query, ctx, args.clicks, args.candidates * 3)
+            records = await discover_google(query, ctx, args.clicks, args.candidates * 3,
+                                            grace_s=args.sorry_wait, captcha_dir=folder)
         except Exception as exc:
             LOG.warning("google discovery failed: %s", exc)
+    if len(records) < args.candidates and ctx is not None:
+        try:
+            more = await discover_yahoo(query, ctx)
+            records.extend(more)
+        except Exception as exc:
+            LOG.warning("yahoo discovery failed: %s", exc)
+    if len(records) < args.candidates and ctx is not None:
+        try:
+            more = await discover_baidu(query, ctx)
+            records.extend(more)
+        except Exception as exc:
+            LOG.warning("baidu discovery failed: %s", exc)
     if len(records) < args.candidates:
         records.extend(await discover_bing(query, client))
     if len(records) < args.candidates:
@@ -462,6 +714,8 @@ def parse_args(argv=None):
     ap.add_argument("--clicks", type=int, default=8)
     ap.add_argument("--proxy", default=os.environ.get("IMG_PROXY", "http://127.0.0.1:7890"))
     ap.add_argument("--no-google", action="store_true")
+    ap.add_argument("--sorry-wait", type=int, default=0,
+                    help="Google 人机验证出现时留几秒人工窗口，默认 0=立即放弃转下一引擎")
     ap.add_argument("--max-mb", type=int, default=20)
     ap.add_argument("--min-short", type=int, default=500)
     ap.add_argument("--min-long", type=int, default=900)
